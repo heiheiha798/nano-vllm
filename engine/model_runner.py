@@ -1,5 +1,4 @@
 import torch
-
 from models.config import Config
 from engine.sequence import Sequence
 from models.qwen3 import Qwen3ForCausalLM
@@ -7,8 +6,27 @@ from layers.sampler import Sampler
 from utils.context import set_context, get_context, reset_context
 from utils.loader import load_model
 
+"""
+这个文件负责真正的模型执行。
+
+如果说：
+
+- scheduler 决定“谁来执行”
+- block_manager 决定“block 怎么分配”
+
+那么 model_runner 决定的就是：
+
+- 这一轮真正送进模型的 input 是什么
+- 这一轮 attention 需要哪些 context 信息
+- KV cache 在显存里如何初始化
+- decode 小 batch 什么时候走 CUDA Graph
+
+这一层是 engine 和模型计算之间的桥。
+"""
+
 
 class ModelRunner:
+    # ModelRunner 持有真正的模型、KV cache 和 graph 相关状态。
 
     def __init__(self, config: Config):
         self.config = config
@@ -16,29 +34,39 @@ class ModelRunner:
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
 
+        # 初始化模型时，把默认 device / dtype 临时切到目标执行环境，
+        # 这样模型构造和权重加载会更直接。
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+
+        # 启动顺序很重要：
+        # 先 warmup，拿到大致显存占用，再决定 KV cache 可以开多大。
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
     def call(self, method_name, *args):
+        # 这里保留成统一 dispatch 形式，是为了让上层只依赖一个入口。
         method = getattr(self, method_name, None)
         return method(*args)
 
     def exit(self):
+        # graph 相关资源只在 graph 模式下存在。
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
 
     def warmup_model(self):
+        # warmup 的目的不是生成真实结果，而是把模型前向先跑一遍，
+        # 让后续显存估算更接近真实执行状态。
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens = self.config.max_num_batched_tokens
@@ -52,6 +80,8 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
+        # 这一层真正申请物理 KV cache tensor。
+        # block_manager 只管 block id，真正的显存空间在这里。
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
@@ -60,6 +90,8 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+
+        # 2 表示 K 和 V 两份 cache。
         block_bytes = (
             2
             * hf_config.num_hidden_layers
@@ -68,8 +100,11 @@ class ModelRunner:
             * head_dim
             * hf_config.dtype.itemsize
         )
+
+        # 这里不是拿满全部显存，而是按 gpu_memory_utilization 留出安全边界。
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
+
         self.kv_cache = torch.empty(
             2,
             hf_config.num_hidden_layers,
@@ -81,16 +116,20 @@ class ModelRunner:
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                # 每一层 attention 模块各自拿到自己对应的 cache 视图。
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
+        # block_table 是变长的，这里统一 pad 成矩阵，方便后续 kernel 使用。
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         return torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
     def prepare_prefill(self, seqs: list[Sequence]):
+        # prefill 阶段会一次处理多个 query token，
+        # 所以这里要把变长 Sequence 打平，并构造 varlen attention 需要的元信息。
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -101,18 +140,25 @@ class ModelRunner:
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
+
+            # start 表示本轮真正需要补算的位置。
+            # 已经 cache 过的 token 不需要重复 prefill。
             start = min(seq.num_cached_tokens, seqlen - 1)
             seqlen_q = seq.num_scheduled_tokens
             seqlen_k = seqlen
             end = start + seqlen_q
+
             input_ids.extend(seq[start:end])
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
+
             if not seq.block_table:
                 continue
+
+            # slot_mapping 记录“这一轮新写入的 token”应该落到 cache 的哪个物理位置。
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
             for i in range(start_block, end_block):
@@ -124,17 +170,26 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
+
+        # 如果 K 的总长度大于 Q 的总长度，说明存在 prefix cache 场景，
+        # attention 需要显式读取 block_tables。
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs)
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+        # 这一轮 attention 需要的上下文，不直接走函数参数传递，
+        # 而是放进 context 供 attention 层读取。
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        # decode 阶段每个 Sequence 每轮只输入 1 个 token，
+        # 所以这里不再构造 varlen Q，而是构造“查整段历史 KV”所需的上下文。
         input_ids = []
         positions = []
         slot_mapping = []
@@ -143,28 +198,41 @@ class ModelRunner:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
+
+            # 这个位置就是“这轮新 token 写回 cache 的落点”。
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
+
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
+        # 采样参数按当前 batch 顺序整理成 tensor。
         temperatures = [seq.temperature for seq in seqs]
         return torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        # 三种情况直接走 eager 前向：
+        #
+        # 1. prefill
+        # 2. 用户强制 eager
+        # 3. batch 太大，当前没有合适的 graph 可复用
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
 
+        # decode 小 batch 才值得走 graph replay。
         bs = input_ids.size(0)
         context = get_context()
         graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
         graph_vars = self.graph_vars
+
+        # replay 前，把这一轮真实输入写进静态 graph buffer。
         graph_vars["input_ids"][:bs] = input_ids
         graph_vars["positions"][:bs] = positions
         graph_vars["slot_mapping"].fill_(-1)
@@ -176,6 +244,8 @@ class ModelRunner:
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # run 是这一层的主入口：
+        # 先准备输入，再执行模型，再做 sampling。
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs)
         logits = self.run_model(input_ids, positions, is_prefill)
@@ -185,6 +255,8 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        # 这里只 capture decode 路径。
+        # 原因是 decode 形状更稳定，prefill 的变长特性太强，不适合统一 capture。
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
@@ -200,6 +272,8 @@ class ModelRunner:
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
+            # 为不同 batch size 预先 capture 一套 graph，
+            # 运行时选“第一个大于等于当前 batch size 的 graph”复用。
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
