@@ -80,6 +80,10 @@ class Sequence:
         # 这些 token 会立刻送去执行。
         self.num_scheduled_tokens = 0
 
+        # 只要还处在 prefill / re-prefill 阶段，就必须保留完整 token_ids。
+        # 进入稳定 decode 后，恢复时只保留 last_token 就够了。
+        self.is_prefill = True
+
         # block_table 把逻辑 token 序列映射到物理 KV cache block。
         # 它是 paged KV cache 的核心索引，不直接存 K/V，只存 block id。
         self.block_table = []
@@ -140,11 +144,7 @@ class Sequence:
         # 就必须保留完整 token_ids。
         # 否则，在“已经完全 cache 化的 decode 状态”下，
         # 只保留 last_token 就够了。
-        last_state = (
-            self.token_ids
-            if self.num_completion_tokens == 0 or self.num_cached_tokens < self.num_tokens
-            else self.last_token
-        )
+        last_state = self.token_ids if self.is_prefill else self.last_token
         return (
             self.num_tokens,
             self.num_prompt_tokens,
@@ -157,9 +157,11 @@ class Sequence:
     def __setstate__(self, state):
         self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
         if isinstance(last_state, list):
+            self.is_prefill = True
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
         else:
             # 在紧凑的 decode-only 状态下，这里故意不恢复完整 token_ids。
+            self.is_prefill = False
             self.token_ids = []
             self.last_token = last_state

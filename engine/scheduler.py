@@ -30,6 +30,7 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
+        self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -53,17 +54,21 @@ class Scheduler:
         # prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
-
-            # 对于一个 waiting Sequence，本轮还需要处理多少 token：
-            # 可能是完整 prompt，也可能是被 chunked / preempt 后剩余的部分。
-            num_tokens = max(seq.num_tokens - seq.num_cached_tokens, 1)
             remaining = self.max_num_batched_tokens - num_batched_tokens
 
-            # 两种情况直接停止继续塞 prefill：
-            # 1. token budget 已经没有了
-            # 2. 这是一个新 Sequence，但当前 block 不够分配
-            if remaining == 0 or (not seq.block_table and not self.block_manager.can_allocate(seq)):
+            # token budget 已经没有了，当前轮次就不能再塞更多 prefill。
+            if remaining == 0:
                 break
+
+            # 对于一个全新 Sequence，先探测有多少前缀 block 可以直接复用。
+            if not seq.block_table:
+                num_cached_blocks = self.block_manager.can_allocate(seq)
+                if num_cached_blocks == -1:
+                    break
+                num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
+            else:
+                # 对于 chunked prefill，真正还需要补算的是“未 cache 的尾部”。
+                num_tokens = seq.num_tokens - seq.num_cached_tokens
 
             # 这里只允许“第一个 Sequence”做 chunked prefill。
             # 原因是如果一个 batch 里多个 Sequence 都被切碎，调度和 accounting 会更复杂。
@@ -72,19 +77,19 @@ class Scheduler:
 
             if not seq.block_table:
                 # 新 Sequence 第一次进入执行前，要先拿到自己的 block_table。
-                self.block_manager.allocate(seq)
+                self.block_manager.allocate(seq, num_cached_blocks)
 
             seq.num_scheduled_tokens = min(num_tokens, remaining)
+            num_batched_tokens += seq.num_scheduled_tokens
 
             # 如果本轮把它剩余的 prefill token 全部覆盖掉，
             # 就可以把它从 waiting 挪到 running。
-            if seq.num_scheduled_tokens == num_tokens:
+            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
 
             scheduled_seqs.append(seq)
-            num_batched_tokens += seq.num_scheduled_tokens
 
         if scheduled_seqs:
             return scheduled_seqs, True
@@ -106,6 +111,7 @@ class Scheduler:
             else:
                 # decode 阶段，每个 Sequence 每轮只 schedule 1 个 token。
                 seq.num_scheduled_tokens = 1
+                seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
 
@@ -120,28 +126,24 @@ class Scheduler:
         # preempt 的语义不是“暂停并保留现场”，
         # 而是释放它当前持有的 block，让它回到 waiting 以后重新竞争资源。
         seq.status = SequenceStatus.WAITING
+        seq.is_prefill = True
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         # postprocess 负责把这轮 model 执行结果写回 Sequence 状态。
         for seq, token_id in zip(seqs, token_ids):
-            if is_prefill:
-                # 这一轮 prefill 完成后，先更新“已经拥有有效 cache 的 token 数”。
-                seq.num_cached_tokens = min(seq.num_cached_tokens + seq.num_scheduled_tokens, seq.num_tokens)
+            self.block_manager.hash_blocks(seq)
+            seq.num_cached_tokens += seq.num_scheduled_tokens
+            seq.num_scheduled_tokens = 0
 
-                # 下面两种情况都不应该立刻 append 新 token：
-                #
-                # 1. chunked prefill：prompt 还没 prefill 完
-                # 2. re-prefill after preemption：之前被抢占，现在只是在补回 cache
-                if seq.num_cached_tokens < seq.num_tokens or seq.num_completion_tokens > 0:
-                    seq.num_scheduled_tokens = 0
-                    continue
+            # prefill 的职责首先是把已有 token 的 KV cache 补齐。
+            # 只有当前序列已经完整 cache 后，才能真正生成下一个 token。
+            if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+                continue
 
             # 只有真正进入“生成新 token”阶段时，才会 append_token。
             seq.append_token(token_id)
-            seq.num_cached_tokens += 1
-            seq.num_scheduled_tokens = 0
 
             # 两种停止条件：
             # 1. 生成了 EOS，且没有忽略 EOS

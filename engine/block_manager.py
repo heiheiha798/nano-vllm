@@ -107,12 +107,22 @@ class BlockManager:
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
-    def _allocate_block(self, block_id: int) -> Block:
+    def _allocate_block(self, block_id: int | None = None) -> Block:
         # 从 free 列表中拿出一个 block，变成 used 状态。
+        if block_id is None:
+            block_id = self.free_block_ids.popleft()
+        else:
+            self.free_block_ids.remove(block_id)
+
         block = self.blocks[block_id]
         assert block.ref_count == 0
+
+        # 空闲 block 可能还残留着旧的 prefix-cache 索引。
+        # 重新分配前先摘掉，避免命中到陈旧映射。
+        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
+            del self.hash_to_block_id[block.hash]
+
         block.reset()
-        self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
         return block
 
@@ -122,48 +132,51 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> bool:
-        # 一个全新 Sequence 进入系统时，需要先为它的所有逻辑 block
-        # 预留出足够的物理 block。
-        return len(self.free_block_ids) >= seq.num_blocks
+    def can_allocate(self, seq: Sequence) -> int:
+        # 返回可直接复用的 prefix block 数。
+        #
+        # 这里故意不复用最后一个逻辑 block：
+        # 即使它刚好是满块，也要重新跑一遍，才能拿到最后一个 token 的 logits。
+        h = -1
+        num_cached_blocks = 0
+        num_new_blocks = seq.num_blocks
 
-    def allocate(self, seq: Sequence):
+        for i in range(seq.num_blocks - 1):
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h)
+            block_id = self.hash_to_block_id.get(h, -1)
+            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                break
+            num_cached_blocks += 1
+            if block_id in self.used_block_ids:
+                num_new_blocks -= 1
+
+        if len(self.free_block_ids) < num_new_blocks:
+            return -1
+        return num_cached_blocks
+
+    def allocate(self, seq: Sequence, num_cached_blocks: int):
         # allocate 只用于“还没有 block_table 的新 Sequence”。
         assert not seq.block_table
         h = -1
-        cache_miss = False
-        for i in range(seq.num_blocks):
+
+        for i in range(num_cached_blocks):
             token_ids = seq.block(i)
-
-            # 只有满块才会参与 prefix cache。
-            # 不完整的最后一块内容还不稳定，不值得进入 hash 索引。
-            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
-            block_id = self.hash_to_block_id.get(h, -1)
-
-            # 即使 hash 命中，也要再比较 token_ids，避免极端哈希冲突。
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                cache_miss = True
-
-            if cache_miss:
-                # 一旦某一块 miss，后面所有块都不能继续沿着这个前缀复用，
-                # 因为前缀链已经断了。
-                block_id = self.free_block_ids[0]
-                block = self._allocate_block(block_id)
+            h = self.compute_hash(token_ids, h)
+            block_id = self.hash_to_block_id[h]
+            block = self.blocks[block_id]
+            if block_id in self.used_block_ids:
+                block.ref_count += 1
             else:
-                # 命中 prefix cache，说明这一整块已经拥有有效 KV cache，
-                # 不需要重复 prefill。
-                seq.num_cached_tokens += self.block_size
-                if block_id in self.used_block_ids:
-                    block = self.blocks[block_id]
-                    block.ref_count += 1
-                else:
-                    # 某些 block 虽然当前不在 used 集合里，但仍然可以通过
-                    # hash 索引重新拿出来复用。
-                    block = self._allocate_block(block_id)
-            if h != -1:
+                block = self._allocate_block(block_id)
                 block.update(h, token_ids)
                 self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
+
+        for _ in range(num_cached_blocks, seq.num_blocks):
+            seq.block_table.append(self._allocate_block().block_id)
+
+        seq.num_cached_tokens = num_cached_blocks * self.block_size
 
     def deallocate(self, seq: Sequence):
         # 释放一个 Sequence 持有的所有 block 引用。
@@ -188,25 +201,19 @@ class BlockManager:
     def may_append(self, seq: Sequence):
         # 这个函数不直接追加 token，它只提前维护 block_table 结构，
         # 确保这次 decode 结束后，新的 token 有合法位置可写。
-        block_table = seq.block_table
-        last_block = self.blocks[block_table[-1]]
-
         if len(seq) % self.block_size == 1:
-            # 新 token 将进入一个全新的逻辑块。
-            # 这意味着上一块已经是满块，因此应该已经拥有有效 hash。
-            assert last_block.hash != -1
-            block_id = self.free_block_ids[0]
-            self._allocate_block(block_id)
-            block_table.append(block_id)
-        elif len(seq) % self.block_size == 0:
-            # 新 token 会刚好把最后一块填满。
-            # 这时最后一块终于可以计算 hash，纳入 prefix cache。
-            assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks - 1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
-        else:
-            # 最后一块还没满，不需要额外操作。
-            assert last_block.hash == -1
+            seq.block_table.append(self._allocate_block().block_id)
+
+    def hash_blocks(self, seq: Sequence):
+        # 只把这一轮真正写满的 block 纳入 prefix cache。
+        start = seq.num_cached_tokens // self.block_size
+        end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
+        if start == end:
+            return
+        h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
+        for i in range(start, end):
+            block = self.blocks[seq.block_table[i]]
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h)
+            block.update(h, token_ids)
+            self.hash_to_block_id[h] = block.block_id
